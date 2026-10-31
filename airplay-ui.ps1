@@ -65,9 +65,14 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 # so an unguarded failure here would kill the app before it can report anything.
 # Crisp type is worth having; it is not worth failing to start over.
 try {
-    Add-Type -Namespace Native -Name Win -MemberDefinition @'
+    if (-not ('Native.Win' -as [type])) {
+        Add-Type -Namespace Native -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 '@
+    }
+    # The DPI call must be OUTSIDE the Add-Type guard: when Add-Type throws on
+    # a second run in the same session, the probe above skips it and the call
+    # still executes. Inside one combined try it used to be silently skipped.
     [void][Native.Win]::SetProcessDPIAware()
 } catch { }
 
@@ -1200,7 +1205,12 @@ try {
         }
         $est = 0
         if ($script:enginePid) {
-            $est = @(Get-NetTCPConnection -State Established -OwningProcess $script:enginePid -ErrorAction SilentlyContinue).Count
+            # Revalidate identity before reading sockets: a PID reused by
+            # another process would otherwise read as "Mirroring".
+            $owner = Get-Process -Id $script:enginePid -ErrorAction SilentlyContinue
+            if ($owner -and $owner.ProcessName -eq 'uxplay') {
+                $est = @(Get-NetTCPConnection -State Established -OwningProcess $script:enginePid -ErrorAction SilentlyContinue).Count
+            }
         }
         Read-EngineLogTail
         if ($est -gt 0) {
@@ -1410,6 +1420,19 @@ try {
         $script:logPath = $null
     }
 
+    # Force-stop a PID only after revalidating it still belongs to uxplay.
+    # The tick's orphan cleanup validates the same way; using a cached PID
+    # without revalidation risks killing a process that reused the ID.
+    function Stop-UxPlayPid {
+        param([int]$Id)
+        try {
+            $target = Get-Process -Id $Id -ErrorAction Stop
+            if ($target.ProcessName -eq 'uxplay') {
+                $target | Stop-Process -Force -ErrorAction Stop
+            }
+        } catch { }
+    }
+
     function Stop-Receiver {
         if (Test-Running) {
             # Kill the ENGINE first: its exit ends the wrapper's Tee pipeline,
@@ -1422,8 +1445,19 @@ try {
                 $engineIds = @(Get-CimInstance Win32_Process -Filter "Name='uxplay.exe' AND ParentProcessId=$($script:proc.Id)" -ErrorAction SilentlyContinue |
                                Select-Object -ExpandProperty ProcessId)
             }
-            foreach ($id in $engineIds) { try { Stop-Process -Id $id -Force -ErrorAction Stop } catch { } }
+            foreach ($id in $engineIds) { Stop-UxPlayPid -Id $id }
             try { $script:proc.WaitForExit(3000) | Out-Null } catch { }
+            # Cold-start race: if Stop was pressed before the wrapper had
+            # spawned uxplay.exe, the first query above found nothing - but the
+            # engine may have appeared while we were waiting for the wrapper to
+            # exit. Re-query the wrapper's children (ParentProcessId stays a
+            # stale-but-matching value after the parent dies) and kill any
+            # engine that showed up late, so uxplay can never outlive the UI.
+            if ($engineIds.Count -eq 0) {
+                $lateIds = @(Get-CimInstance Win32_Process -Filter "Name='uxplay.exe' AND ParentProcessId=$($script:proc.Id)" -ErrorAction SilentlyContinue |
+                             Select-Object -ExpandProperty ProcessId)
+                foreach ($id in $lateIds) { Stop-UxPlayPid -Id $id }
+            }
             if (-not $script:proc.HasExited) {
                 try { $script:proc.Kill(); $script:proc.WaitForExit(2000) | Out-Null } catch { }
             }
@@ -1442,6 +1476,13 @@ try {
 
     $ui.StartBtn.Add_Click({
         try {
+            # Debounce: WPF delivers one Click per press+release, so a
+            # double-click enqueues two toggles - start, then instantly stop,
+            # which looks like "the app did not start". Swallow the second
+            # click of a rapid pair.
+            $now = [DateTime]::UtcNow
+            if ($script:lastToggleClick -and ($now - $script:lastToggleClick).TotalMilliseconds -lt 400) { return }
+            $script:lastToggleClick = $now
             if (Test-Running) {
                 Stop-Receiver
             } else {
@@ -1545,9 +1586,14 @@ try {
             # opening/closing the frame as a side effect - the deliberate
             # launch follows, once, after the state is final.
             $script:suppressFrameEvents = $true
-            $ui.FrameCheck.IsChecked = $true      # default: the framed view is the app's face
-            if (-not $script:isSelfTest) { Restore-UiSettings }
-            $script:suppressFrameEvents = $false
+            try {
+                $ui.FrameCheck.IsChecked = $true      # default: the framed view is the app's face
+                if (-not $script:isSelfTest) { Restore-UiSettings }
+            } finally {
+                # Reset the flag even if the restore throws: if it stayed $true
+                # the frame switch would be dead for the whole session.
+                $script:suppressFrameEvents = $false
+            }
             if ($ui.FrameCheck.IsChecked -and -not $script:isSelfTest) {
                 try { Start-FramedMirror } catch { }
             }
