@@ -22,6 +22,10 @@
     the iPhone's Screen Mirroring list.
 .PARAMETER SkipInstall
     Skip the install step entirely (e.g. UxPlay already installed manually).
+    Also the right choice on headless machines: the vendor's 1.72.1-3 Inno
+    installer needs an interactive session and stalls forever with /VERYSILENT
+    on session-0 CI runners, so CI passes -SkipInstall and covers the engine
+    download/SHA-verify path separately.
 .PARAMETER UseWinget
     Install from winget instead of the GitHub release. The winget package
     leapbtw.uxplay is pinned to 1.72.1.3, which is the same generation this
@@ -306,7 +310,13 @@ function Install-FromWinget {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         throw "winget is not available on this machine."
     }
-    winget install --id leapbtw.uxplay --exact `
+    # Pinned on purpose. winget's newest leapbtw.uxplay is the 2.x Qt6 rewrite
+    # (no uxplay.exe, no CLI), so an unpinned "fallback" would silently install
+    # an engine these scripts cannot drive - observed live: 2.0.0.1736, whose
+    # install then had to be detected and rejected downstream. If winget has
+    # dropped the 1.72.1.3 manifest, this exits non-zero and the caller prints
+    # the manual 1.72.1-3 instructions instead.
+    winget install --id leapbtw.uxplay --exact --version 1.72.1.3 `
         --accept-package-agreements --accept-source-agreements
     # winget exits 0 on success, or -1978335135 when already installed.
     if ($LASTEXITCODE -eq 0) {

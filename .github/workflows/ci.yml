@@ -37,16 +37,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The exact flow a new user runs: query upstream releases, download the
-      # pinned 1.x installer, verify its SHA-256 against the API digest, silent
-      # install, create the firewall rules (runner shells are elevated, so they
-      # really get created). Bonjour is absent on runners and cannot be
-      # redistributed, so its check is downgraded to a warning here.
-      - name: Real setup (engine download + firewall)
+      # The exact flow a new user runs, minus the engine binary: the vendor's
+      # 1.72.1-3 Inno installer stalls forever with /VERYSILENT on session-0
+      # runners (verified in run 41249461119 - download and SHA-256 verified in
+      # seconds, then the silent install never finished), so CI installs the
+      # firewall rules and repair logic against an absent engine via
+      # -SkipInstall. The self-tests below explicitly support "no usable
+      # engine". Bonjour is absent on runners and cannot be redistributed, so
+      # its check is downgraded to a warning here.
+      - name: Real setup (firewall rules, engine absent)
         shell: powershell
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -SkipBonjourCheck
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -SkipInstall -SkipBonjourCheck
 
       - name: UI self-test
         shell: powershell
