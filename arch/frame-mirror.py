@@ -29,10 +29,13 @@ def geometry(video: tuple[int, int, int, int]) -> list[tuple[int, int, int, int]
 
 
 def find_window(name: str) -> tuple[int, int, int, int] | None:
-    result = subprocess.run(
-        ["wmctrl", "-lG"], text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["wmctrl", "-lG"], text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, check=False, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     for line in result.stdout.splitlines():
         parts = line.split(None, 7)
         if len(parts) < 8:
@@ -54,7 +57,17 @@ def self_test() -> int:
     return 0
 
 
-def run(name: str) -> int:
+def uxplay_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # Exists but owned by another user: still alive.
+    return True
+
+
+def run(name: str, uxplay_pid: int | None = None) -> int:
     if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
         print(
             "The iPhone frame helper requires an X11 session. Wayland does not let one app inspect "
@@ -98,6 +111,11 @@ def run(name: str) -> int:
         windows.append(window)
 
     def update():
+        # Follow the receiver's lifetime when a PID was supplied: without
+        # this the frame keeps polling forever after uxplay is gone.
+        if uxplay_pid is not None and not uxplay_alive(uxplay_pid):
+            Gtk.main_quit()
+            return False
         found = find_window(name)
         if not found:
             for item in windows: item.hide()
@@ -115,9 +133,10 @@ def run(name: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Decorate the UxPlay video window with an iPhone-like frame")
     parser.add_argument("--name", default="PC")
+    parser.add_argument("--pid", type=int, default=None, help="exit automatically when this uxplay process ends")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
-    return self_test() if args.self_test else run(args.name)
+    return self_test() if args.self_test else run(args.name, args.pid)
 
 
 if __name__ == "__main__":

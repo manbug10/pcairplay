@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import struct
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -38,11 +39,14 @@ from pcairplay_common import (  # noqa: E402
     inspect_uxplay,
     load_settings,
     new_log_path,
+    uxplay_install_hint,
 )
 
 APP_ID = "io.github.gbulog.pcairplay.control"
 DEVICE_NAME = "AirPlayPC Input"
-SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"pcairplay-control-{os.getuid()}.sock"
+# An empty XDG_RUNTIME_DIR must be treated as unset (XDG spec).
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+SOCKET_PATH = Path(RUNTIME_DIR) / f"pcairplay-control-{os.getuid()}.sock"
 EMBEDDED_RESOLUTION = "1920x1080"
 PAIRING_AGENT_PATH = "/io/github/gbulog/pcairplay/agent"
 VERTICAL_SCROLL_GAIN = 0.35
@@ -325,7 +329,7 @@ def create_services():
             descriptor,
         )
     except ImportError as error:
-        raise RuntimeError("bluez-peripheral is missing; re-run ./setup.sh") from error
+        raise RuntimeError(f"bluez-peripheral is missing; {uxplay_install_hint()}") from error
 
     class HidService(Service):
         def __init__(self) -> None:
@@ -417,6 +421,11 @@ async def handle_client(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     state: HidState, stop: asyncio.Event,
 ) -> None:
+    # Typing is intentionally slow (~0.15 s per key), so text jobs run as
+    # background tasks chained one after another. This keeps key order stable
+    # while pointer moves and clicks on the same connection stay responsive
+    # instead of being blocked behind a long paste.
+    pending_text: asyncio.Task | None = None
     try:
         while line := await reader.readline():
             try:
@@ -441,7 +450,22 @@ async def handle_client(
                 elif kind == "key":
                     await state.key(int(message.get("modifier", 0)), int(message["code"]))
                 elif kind == "text":
-                    await state.text(str(message.get("value", ""))[:10_000])
+                    value = str(message.get("value", ""))[:2_000]
+
+                    def _queue_text(previous: asyncio.Task | None, value: str = value) -> Any:
+                        async def runner() -> None:
+                            if previous is not None:
+                                try:
+                                    await previous
+                                except asyncio.CancelledError:
+                                    return
+                                except Exception:
+                                    LOGGER.exception("Previous text job failed")
+                            await state.text(value)
+                        return runner()
+
+                    previous = pending_text if (pending_text and not pending_text.done()) else None
+                    pending_text = asyncio.create_task(_queue_text(previous))
                 elif kind == "consumer":
                     await state.consumer_key(int(message.get("usage", 0)))
                 elif kind == "pointer_button":
@@ -466,11 +490,39 @@ async def handle_client(
     except (ConnectionError, OSError) as error:
         LOGGER.debug("Local control client disconnected: %s", error)
     finally:
+        if pending_text and not pending_text.done():
+            pending_text.cancel()
         writer.close()
         try:
             await writer.wait_closed()
         except (ConnectionError, OSError):
             pass
+
+
+def prepare_socket_path() -> None:
+    """Remove a stale control socket without hijacking a live server.
+
+    Blindly unlinking the socket would let a second instance steal the
+    endpoint from a running server, leaving the old one orphaned while the
+    new one receives the shutdown signal.
+    """
+    try:
+        SOCKET_PATH.stat()
+    except FileNotFoundError:
+        return
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.25)
+    try:
+        probe.connect(str(SOCKET_PATH))
+    except OSError:
+        # Nobody is accepting connections: the socket file is stale.
+        SOCKET_PATH.unlink(missing_ok=True)
+    else:
+        raise RuntimeError(
+            f"Another AirPlayPC control server is already listening on {SOCKET_PATH}"
+        )
+    finally:
+        probe.close()
 
 
 async def serve() -> int:
@@ -480,7 +532,7 @@ async def serve() -> int:
         from bluez_peripheral.agent import NoIoAgent
         from bluez_peripheral.util import get_message_bus
     except ImportError as error:
-        print(f"ERROR: Bluetooth support dependency is missing: {error}. Re-run ./setup.sh.", flush=True)
+        print(f"ERROR: Bluetooth support dependency is missing: {error}. {uxplay_install_hint().capitalize()}.", flush=True)
         return 2
 
     stop = asyncio.Event()
@@ -517,7 +569,7 @@ async def serve() -> int:
         advert = Advertisement(DEVICE_NAME, ["1812"], appearance=0x03C0, timeout=0, discoverable=True)
         await advert.register(bus, adapter=adapter)
         advertisement["current"] = advert
-        SOCKET_PATH.unlink(missing_ok=True)
+        prepare_socket_path()
         state = HidState(
             hid.mouse_input, hid.keyboard_input,
             hid.absolute_input, hid.consumer_input,
@@ -553,7 +605,7 @@ async def serve() -> int:
             server.close()
             try:
                 await asyncio.wait_for(server.wait_closed(), timeout=2.0)
-            except TimeoutError:
+            except (asyncio.TimeoutError, TimeoutError):
                 LOGGER.warning("Timed out while closing the local control server")
         if pairing_guard:
             pairing_guard.cancel()
@@ -577,7 +629,7 @@ async def serve() -> int:
         for label, action in cleanup_actions:
             try:
                 await asyncio.wait_for(action(), timeout=2.0)
-            except TimeoutError:
+            except (asyncio.TimeoutError, TimeoutError):
                 LOGGER.warning("Timed out while restoring %s", label)
             except Exception as error:
                 LOGGER.warning("Could not restore %s: %s", label, error)
@@ -601,7 +653,7 @@ async def close_pairing_after_subscription(
     while not stop.is_set() and not state.subscribed:
         try:
             await asyncio.wait_for(stop.wait(), timeout=0.25)
-        except TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             pass
     if stop.is_set() or not state.subscribed:
         return
@@ -754,6 +806,8 @@ def run_gui(auto_start: bool = False) -> int:
             self.video_cursor_visible = False
             self.video_last_motion = None
             self.absolute_ready = False
+            self.video_button_down = False
+            self.server_output = deque(maxlen=30)
             self.scroll_accumulator = ScrollAccumulator()
             self.closing = False
             self.window = Gtk.ApplicationWindow(application=app, title="AirPlayPC Mirror & Control")
@@ -914,18 +968,26 @@ def run_gui(auto_start: bool = False) -> int:
             context.arc(x, y, 8, 0, 6.2832); context.set_line_width(3); context.stroke()
 
         def video_coordinates(self, x, y):
+            """Map a widget position to normalized video coordinates.
+
+            Returns None when the pointer is on the letterbox padding around
+            the video so callers can drop the event instead of forwarding an
+            edge tap to the phone.
+            """
             width, height = self.picture.get_width(), self.picture.get_height()
             paintable = self.picture.get_paintable()
             intrinsic_width = paintable.get_intrinsic_width() if paintable else width
             intrinsic_height = paintable.get_intrinsic_height() if paintable else height
             if intrinsic_width <= 0 or intrinsic_height <= 0 or width <= 0 or height <= 0:
-                return 0.5, 0.5
+                return None
             scale = min(width / intrinsic_width, height / intrinsic_height)
             shown_width, shown_height = intrinsic_width * scale, intrinsic_height * scale
             left, top = (width - shown_width) / 2, (height - shown_height) / 2
+            if x < left or y < top or x > left + shown_width or y > top + shown_height:
+                return None
             return (
-                max(0.0, min(1.0, (x - left) / shown_width)),
-                max(0.0, min(1.0, (y - top) / shown_height)),
+                (x - left) / shown_width,
+                (y - top) / shown_height,
             )
 
         def video_motion_enter(self, _controller, x, y):
@@ -937,12 +999,16 @@ def run_gui(auto_start: bool = False) -> int:
             self.video_cursor = (x, y)
             self.video_cursor_layer.queue_draw()
             if self.absolute_ready:
-                normalized_x, normalized_y = self.video_coordinates(x, y)
-                self.client.send({
-                    "type": "absolute",
-                    "x": normalized_x * 32767,
-                    "y": normalized_y * 32767,
-                })
+                coordinates = self.video_coordinates(x, y)
+                if coordinates:
+                    normalized_x, normalized_y = coordinates
+                    self.client.send({
+                        "type": "absolute",
+                        "x": normalized_x * 32767,
+                        "y": normalized_y * 32767,
+                    })
+                # Motion over the letterbox keeps the last phone position:
+                # never push the pointer to an edge from a dead-zone move.
             elif self.video_last_motion:
                 self.client.send({
                     "type": "move",
@@ -956,14 +1022,22 @@ def run_gui(auto_start: bool = False) -> int:
             self.video_last_motion = None
             self.video_cursor_layer.queue_draw()
 
-        def video_click_pressed(self, _gesture, _count, _x, _y):
+        def video_click_pressed(self, _gesture, _count, x, y):
             self.picture.grab_focus()
+            if self.absolute_ready and self.video_coordinates(x, y) is None:
+                return  # A click on the letterbox must not tap the phone edge.
+            self.video_button_down = True
             self.client.send({
                 "type": "button", "button": 1, "pressed": True,
                 "absolute": self.absolute_ready,
             })
 
         def video_click_released(self, _gesture, _count, _x, _y):
+            # Only release what was pressed, even if the pointer left the
+            # video area mid-drag; otherwise the button stays stuck down.
+            if not self.video_button_down:
+                return
+            self.video_button_down = False
             self.client.send({
                 "type": "button", "button": 1, "pressed": False,
                 "absolute": self.absolute_ready,
@@ -1021,7 +1095,25 @@ def run_gui(auto_start: bool = False) -> int:
                 [sys.executable, str(Path(__file__).resolve()), "--server"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )
+            self.server_output.clear()
+            # The server logs to stdout continuously. If nobody drains the
+            # pipe it fills up (~64 KB) and the BLE input silently freezes,
+            # so a background thread keeps it drained at all times.
+            threading.Thread(target=self._drain_server_output, daemon=True).start()
             self.status_label.set_text("Starting Bluetooth HID peripheral…")
+
+        def _drain_server_output(self):
+            process = self.server_process
+            if not process or not process.stdout:
+                return
+            try:
+                for line in process.stdout:
+                    text = line.rstrip()
+                    if text:
+                        self.server_output.append(text)
+                        LOGGER.info("BLE server: %s", text)
+            except (ValueError, OSError):
+                pass
 
         def toggle_server(self, _button):
             if self.client.status() or (self.server_process and self.server_process.poll() is None):
@@ -1050,7 +1142,7 @@ def run_gui(auto_start: bool = False) -> int:
 
         def start_video_pipeline(self, port):
             if Gst.ElementFactory.find("gtk4paintablesink") is None:
-                raise RuntimeError("gst-plugin-gtk4 is missing; re-run ./setup.sh")
+                raise RuntimeError(f"gst-plugin-gtk4 is missing; {uxplay_install_hint()}")
             description = (
                 f'udpsrc address=127.0.0.1 port={port} '
                 'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
@@ -1074,7 +1166,7 @@ def run_gui(auto_start: bool = False) -> int:
         def start_receiver(self):
             executable = find_uxplay()
             if not executable:
-                self.receiver_status.set_text("UxPlay is missing — run ./setup.sh")
+                self.receiver_status.set_text(f"UxPlay is missing — {uxplay_install_hint()}")
                 return
             support = inspect_uxplay(executable)
             if not support.compatible:
@@ -1088,7 +1180,7 @@ def run_gui(auto_start: bool = False) -> int:
             try:
                 args, _notes = build_embedded_receiver_args(load_settings(), port)
                 self.start_video_pipeline(port)
-            except (RuntimeError, ValueError) as error:
+            except (RuntimeError, ValueError, GLib.Error) as error:
                 self.receiver_status.set_text(str(error))
                 self.stop_video_pipeline()
                 return
@@ -1170,7 +1262,7 @@ def run_gui(auto_start: bool = False) -> int:
                 self.status_label.set_text(control_status_text(status))
                 self.start_button.set_label("Stop Bluetooth input")
             elif self.server_process and self.server_process.poll() is not None:
-                output = self.server_process.stdout.read().strip() if self.server_process.stdout else ""
+                output = " \u2014 ".join(list(self.server_output)[-2:])
                 self.status_label.set_text(output or "Bluetooth input failed to start")
                 self.server_process = None; self.start_button.set_label("Start Bluetooth input")
             if self.video_sink:

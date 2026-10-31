@@ -27,6 +27,7 @@ from pcairplay_common import (  # noqa: E402
     load_settings,
     new_log_path,
     save_settings,
+    uxplay_install_hint,
 )
 
 
@@ -176,8 +177,14 @@ class AirPlayWindow:
     def append_log(self, text: str):
         buffer = self.log_view.get_buffer()
         buffer.insert(buffer.get_end_iter(), text)
-        mark = buffer.create_mark(None, buffer.get_end_iter(), False)
-        self.log_view.scroll_mark_onscreen(mark)
+        # Reuse the buffer-owned insert mark instead of creating (and leaking)
+        # a new TextMark per line, and keep the log bounded for long sessions.
+        self.log_view.scroll_mark_onscreen(buffer.get_insert())
+        line_count = buffer.get_line_count()
+        if line_count > 2000:
+            start = buffer.get_iter_at_line(0)
+            end = buffer.get_iter_at_line(line_count - 2000)
+            buffer.delete(start, end)
         return False
 
     def set_running(self, running: bool):
@@ -201,7 +208,7 @@ class AirPlayWindow:
     def start_receiver(self):
         executable = find_uxplay()
         if not executable:
-            self.status.set_text("UxPlay is missing — run arch/setup.sh")
+            self.status.set_text(f"UxPlay is missing — {uxplay_install_hint()}")
             return
         support = inspect_uxplay(executable)
         if not support.compatible:
@@ -219,6 +226,12 @@ class AirPlayWindow:
             self.status.set_text(str(error))
             return
         save_settings(settings)
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except (OSError, ValueError):
+                pass
+            self.log_file = None
         log_path = new_log_path("airplay-ui")
         self.log_file = log_path.open("w", encoding="utf-8")
         self.log_file.write("argv: " + " ".join(args) + "\n---\n")
@@ -246,9 +259,15 @@ class AirPlayWindow:
     def read_output(self):
         process = self.process
         assert process and process.stdout
+        log_file = self.log_file  # Captured locally: the UI may reset it on restart.
         for line in process.stdout:
-            if self.log_file:
-                self.log_file.write(line); self.log_file.flush()
+            if process is not self.process:
+                break  # A new receiver took over; drop stale status updates.
+            if log_file:
+                try:
+                    log_file.write(line); log_file.flush()
+                except (ValueError, OSError):
+                    log_file = None
             lower = line.lower()
             if "initialized server socket" in lower:
                 self.GLib.idle_add(self.status.set_text, "Discoverable")
@@ -258,9 +277,13 @@ class AirPlayWindow:
                 self.GLib.idle_add(self.status.set_text, "iPhone connected")
             self.GLib.idle_add(self.append_log, line)
         code = process.wait()
-        self.GLib.idle_add(self.receiver_exited, code)
+        self.GLib.idle_add(self.receiver_exited, process, code)
 
-    def receiver_exited(self, code: int):
+    def receiver_exited(self, process, code: int):
+        # Ignore stale exits so a late notification from a previous receiver
+        # cannot tear down the log or state of a freshly started one.
+        if process is not self.process:
+            return False
         if self.log_file:
             self.log_file.close(); self.log_file = None
         self.process = None
@@ -277,8 +300,18 @@ class AirPlayWindow:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            # Escalate to SIGKILL so the UI never stays on "Stopping…" if
+            # UxPlay hangs and keeps ignoring SIGTERM.
+            threading.Timer(5.0, self._force_kill_receiver, args=(process,)).start()
         self.status.set_text("Stopping…")
         self.stop_frame()
+
+    def _force_kill_receiver(self, process):
+        try:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
     def frame_toggled(self, switch, _param):
         if self.process and self.process.poll() is None:
@@ -289,11 +322,25 @@ class AirPlayWindow:
         if self.frame_process and self.frame_process.poll() is None:
             return
         script = SCRIPT_DIR / "frame-mirror.py"
-        self.frame_process = subprocess.Popen([sys.executable, str(script), "--name", self.name.get_text()])
+        command = [sys.executable, str(script), "--name", self.name.get_text()]
+        if self.process:
+            command += ["--pid", str(self.process.pid)]
+        try:
+            self.frame_process = subprocess.Popen(command)
+        except OSError as error:
+            self.status.set_text(f"Could not start the framed mirror: {error}")
 
     def stop_frame(self):
         if self.frame_process and self.frame_process.poll() is None:
             self.frame_process.terminate()
+            try:
+                self.frame_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.frame_process.kill()
+                try:
+                    self.frame_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass  # Reaped later by subprocess machinery.
         self.frame_process = None
 
     def open_diagnostics(self, _button):
@@ -313,8 +360,10 @@ class AirPlayWindow:
     def on_close(self, _window):
         try:
             save_settings(self.current_settings())
-        except Exception:
-            pass
+        except Exception as error:
+            # Never lose the user's configuration silently.
+            self.append_log(f"Warning: could not save settings: {error}\n")
+            print(f"Could not save settings: {error}", file=sys.stderr)
         self.stop_receiver()
         return False
 

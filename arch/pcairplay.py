@@ -19,6 +19,7 @@ from pathlib import Path
 from pcairplay_common import (
     DEFAULT_PORT,
     ReceiverSettings,
+    SOURCE_LAYOUT,
     build_uxplay_args,
     command_output,
     competing_receivers,
@@ -36,6 +37,7 @@ from pcairplay_common import (
     service_active,
     shell_join,
     uses_external_dnssd,
+    uxplay_install_hint,
 )
 
 
@@ -83,7 +85,7 @@ def add_receiver_arguments(parser: argparse.ArgumentParser) -> None:
 def run_receiver(args: argparse.Namespace) -> int:
     executable = find_uxplay()
     if not executable:
-        print(colored("UxPlay is not installed. Run arch/setup.sh first.", "red"), file=sys.stderr)
+        print(colored(f"UxPlay is not installed; {uxplay_install_hint()}.", "red"), file=sys.stderr)
         return 1
     support = inspect_uxplay(executable)
     if not support.compatible:
@@ -140,11 +142,18 @@ def run_receiver(args: argparse.Namespace) -> int:
     if log_file:
         log_file.write(f"engine  : {executable}\nversion : {support.version}\nargv    : {shell_join(built)}\n---\n")
         log_file.flush()
-    launch = [shutil.which("stdbuf"), "-oL", "-eL", *command] if shutil.which("stdbuf") else command
-    process = subprocess.Popen(
-        launch, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, errors="replace",
-    )
+    stdbuf = shutil.which("stdbuf")
+    launch = [stdbuf, "-oL", "-eL", *command] if stdbuf else command
+    try:
+        process = subprocess.Popen(
+            launch, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, errors="replace",
+        )
+    except OSError as error:
+        if log_file:
+            log_file.close()
+        print(colored(f"Could not start UxPlay: {error}", "red"), file=sys.stderr)
+        return 1
 
     def stop(_signum: int, _frame: object) -> None:
         if process.poll() is None:
@@ -159,7 +168,12 @@ def run_receiver(args: argparse.Namespace) -> int:
             if log_file:
                 log_file.write(line)
                 log_file.flush()
-        return process.wait()
+        code = process.wait()
+        # A clean Ctrl+C (or a graceful SIGTERM stop) must not leak the
+        # signal status (-15/-2) to callers checking the exit code.
+        if code in (0, -signal.SIGTERM, -signal.SIGINT):
+            return 0
+        return code
     finally:
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTERM, previous_term)
@@ -218,7 +232,8 @@ def doctor(args: argparse.Namespace) -> int:
                 "Install UxPlay 1.73 or newer with -scrsv and -vrtp support.",
             )
     else:
-        report.fail("UxPlay is not installed.", "Run ./arch/setup.sh")
+        fix = "Run ./arch/setup.sh" if SOURCE_LAYOUT else "Install the 'uxplay' package (pacman or an AUR helper)."
+        report.fail("UxPlay is not installed.", fix)
 
     report.heading("GStreamer")
     required = ["h264parse", "decodebin", "avdec_h264", "autovideosink", "autoaudiosink"]
@@ -294,7 +309,8 @@ def doctor(args: argparse.Namespace) -> int:
         if code == 0:
             report.passed("firewalld allows the AirPlayPC service (mDNS and TCP/UDP 7000-7002).")
         else:
-            report.fail("firewalld does not allow the AirPlayPC service.", "Re-run ./arch/setup.sh")
+            fix = "Re-run ./arch/setup.sh" if SOURCE_LAYOUT else "Add firewalld rules for mDNS and the receiver ports manually."
+            report.fail("firewalld does not allow the AirPlayPC service.", fix)
     if ufw_active:
         if ufw_code != 0:
             report.warn("UFW is active, but its rules require root to inspect; run doctor with sudo or inspect `sudo ufw status`.")
@@ -304,7 +320,8 @@ def doctor(args: argparse.Namespace) -> int:
                 if value in normalized:
                     report.passed(f"UFW has a rule for {label}.")
                 else:
-                    report.fail(f"UFW has no visible rule for {label}.", "Re-run ./arch/setup.sh")
+                    fix = "Re-run ./arch/setup.sh" if SOURCE_LAYOUT else f"Run 'sudo ufw allow {value.replace('/', ' ')}'."
+                    report.fail(f"UFW has no visible rule for {label}.", fix)
 
     report.heading("Processes and ports")
     rivals = competing_receivers(include_uxplay=False)
@@ -334,7 +351,8 @@ def doctor(args: argparse.Namespace) -> int:
     if importlib.util.find_spec("bluez_peripheral") and importlib.util.find_spec("dbus_fast"):
         report.passed("Bluetooth HID Python support is installed.")
     else:
-        report.warn("Bluetooth HID support is missing; re-run ./setup.sh to enable iPhone control.")
+        fix = "re-run ./setup.sh" if SOURCE_LAYOUT else "install python-dbus-fast and the bluez_peripheral wheel (see README)."
+        report.warn(f"Bluetooth HID support is missing; {fix} to enable iPhone control.")
     if service_active("bluetooth.service"):
         report.passed("bluetooth.service is active.")
     else:

@@ -30,12 +30,28 @@ UXPLAY_REQUIRED_OPTIONS = ("-scrsv", "-vrtp")
 
 
 def _xdg_path(variable: str, fallback: str) -> Path:
-    return Path(os.environ.get(variable, str(Path.home() / fallback))).expanduser()
+    # An empty XDG variable must be treated as unset per the XDG base
+    # directory spec, otherwise config/state land in a cwd-relative path.
+    value = os.environ.get(variable) or ""
+    base = Path(value) if value.strip() else Path.home() / fallback
+    return base.expanduser()
 
 
 CONFIG_DIR = _xdg_path("XDG_CONFIG_HOME", ".config") / "pcairplay"
 STATE_DIR = _xdg_path("XDG_STATE_HOME", ".local/state") / "pcairplay"
 SETTINGS_PATH = CONFIG_DIR / "ui-settings.json"
+
+# This module lives next to the repository scripts in a source checkout, but
+# is installed to /usr/lib/pcairplay (or similar) by the PKGBUILD. Use that
+# to give setup advice that actually applies to the current installation.
+SOURCE_LAYOUT = (Path(__file__).resolve().parent / "setup.sh").is_file()
+
+
+def uxplay_install_hint() -> str:
+    """Return the right repair hint for this installation type."""
+    if SOURCE_LAYOUT:
+        return "run ./setup.sh from the AirPlayPC folder"
+    return "install the 'uxplay' package (pacman or your AUR helper)"
 
 
 @dataclass
