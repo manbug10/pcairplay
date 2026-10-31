@@ -38,14 +38,19 @@ param(
 # Individual checks guard their own cmdlets, so a non-terminating error stays a
 # check result rather than aborting the run. Anything that does throw must not
 # leave a half-printed report that reads like a clean bill of health - the trap
-# says so out loud and exits non-zero.
+# says so out loud and exits non-zero. The trap is registered ONLY for direct
+# runs: a script-scope trap registered by dot-sourcing would keep firing
+# 'exit 2' on later errors in the CALLER's session - exactly what the
+# end-of-script guard below refuses to do.
 $ErrorActionPreference = 'Continue'
-trap {
-    Write-Host ""
-    Write-Host "  [FAIL] doctor.ps1 stopped early: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "         The report above is INCOMPLETE - do not read it as a pass." -ForegroundColor Yellow
-    Write-Host ""
-    exit 2
+if ($MyInvocation.InvocationName -ne '.') {
+    trap {
+        Write-Host ""
+        Write-Host "  [FAIL] doctor.ps1 stopped early: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "         The report above is INCOMPLETE - do not read it as a pass." -ForegroundColor Yellow
+        Write-Host ""
+        exit 2
+    }
 }
 
 . (Join-Path $PSScriptRoot 'uxplay-common.ps1')
@@ -317,7 +322,7 @@ $rivals = @(Get-CompetingReceiverProcess)
 if ($rivals.Count -gt 0) {
     $names = ($rivals | Select-Object -ExpandProperty ProcessName -Unique) -join ', '
     Fail "Another AirPlay receiver is running: $names" `
-         "Close it. It holds port 7000 and shows a second device in the iPhone's mirroring list. Stop-Process -Name $($rivals[0].ProcessName) -Force"
+         "Close it. It holds port 7000 and shows a second device in the iPhone's mirroring list. Stop-Process -Id $($rivals[0].Id) -Force"
 } else {
     Pass "No competing AirPlay receiver app is running."
 }

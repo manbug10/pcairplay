@@ -93,8 +93,22 @@ public static class FrameNative
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT r);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr hWnd, int x, int y, int w, int h, bool repaint);
-    [DllImport("user32.dll", EntryPoint="GetWindowLongPtr")] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int idx);
-    [DllImport("user32.dll", EntryPoint="SetWindowLongPtr")] public static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int idx, IntPtr val);
+    // GetWindowLongPtr/SetWindowLongPtr only exist in the 64-bit user32.dll;
+    // the 32-bit exports are GetWindowLong/SetWindowLong. Dispatch on pointer
+    // width so a 32-bit Windows PowerShell (SysWOW64) gets EntryPointNotFound
+    // instead of a silent frame failure.
+    [DllImport("user32.dll", EntryPoint="GetWindowLong")] private static extern IntPtr GetWindowLong32(IntPtr hWnd, int idx);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtr")] private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int idx);
+    [DllImport("user32.dll", EntryPoint="SetWindowLong")] private static extern IntPtr SetWindowLong32(IntPtr hWnd, int idx, IntPtr val);
+    [DllImport("user32.dll", EntryPoint="SetWindowLongPtr")] private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int idx, IntPtr val);
+    public static IntPtr GetWindowLongPtr(IntPtr hWnd, int idx)
+    {
+        return IntPtr.Size == 8 ? GetWindowLongPtr64(hWnd, idx) : GetWindowLong32(hWnd, idx);
+    }
+    public static IntPtr SetWindowLongPtr(IntPtr hWnd, int idx, IntPtr val)
+    {
+        return IntPtr.Size == 8 ? SetWindowLongPtr64(hWnd, idx) : SetWindowLong32(hWnd, idx);
+    }
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int w, int h, uint flags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
@@ -544,7 +558,18 @@ if ($SelfTest) {
 # shared via uxplay-common.ps1 because the UI probes it to know whether a
 # frame exists at all.
 $script:MutexCreated = $false
-$script:SingleInstance = New-Object System.Threading.Mutex($true, (Get-FramedMirrorMutexName), ([ref]$script:MutexCreated))
+try {
+    $script:SingleInstance = New-Object System.Threading.Mutex($true, (Get-FramedMirrorMutexName), ([ref]$script:MutexCreated))
+} catch [System.UnauthorizedAccessException] {
+    # A frame instance from another (elevated) session owns the mutex: treat it
+    # as "already running" instead of dying with a raw exception.
+    if (-not $Quiet) {
+        [System.Windows.MessageBox]::Show(
+            'The framed mirror is already running in another session - look for its window (it may be behind others).',
+            'AirPlayPC', 'OK', 'Information') | Out-Null
+    }
+    exit 0
+}
 if (-not $script:MutexCreated) {
     if (-not $Quiet) {
         [System.Windows.MessageBox]::Show(
@@ -572,6 +597,7 @@ $script:BlockedHwnd  = [IntPtr]::Zero   # a window that refused adoption (elevat
 $script:PhoneSince   = $null        # first sighting of an established engine connection
 $script:MeasureStable = 0           # consecutive aspect measurements that changed nothing
 $script:NetLast      = $null        # last Get-NetTCPConnection sample (a CIM call - time-gated)
+$script:LastTickErrorLog = $null    # rate-limits the tick catch's debug logging
 $script:DebugLog = Join-Path (Get-PCAirPlayLogDirectory) 'frame-debug.log'
 $null = New-Item -ItemType Directory -Force -Path (Split-Path $script:DebugLog)
 # Append-only forever is a slow leak; one .old generation is plenty of history.
@@ -1076,7 +1102,19 @@ function Invoke-FrameTick {
         } else {
             $ui.WaitDetail.Text = "Receiver is up - mirror from the iPhone and the video lands here"
         }
-    } catch { }   # a transient race (window died mid-tick) must not kill the timer
+    } catch {
+        # A transient race (window died mid-tick) must not kill the timer, but
+        # the blanket swallow used to hide real bugs completely (it did once,
+        # see the 2026-07-20 wheel report). Rate-limit to one line per minute
+        # so a recurring race cannot flood the debug log.
+        try {
+            $nowTick = Get-Date
+            if (-not $script:LastTickErrorLog -or (($nowTick - $script:LastTickErrorLog).TotalSeconds -ge 60)) {
+                $script:LastTickErrorLog = $nowTick
+                Write-FrameLog ("tick error: {0}" -f $_.Exception.Message)
+            }
+        } catch { }
+    }
 }
 
 $timer.Add_Tick({

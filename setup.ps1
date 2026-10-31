@@ -154,7 +154,20 @@ function Get-TargetRelease {
     # download itself is unauthenticated either way.
     $headers = @{ 'User-Agent' = 'pcairplay-setup' }
     if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
-    $all = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec 30
+    # Paginate: without ?per_page the API returns only the first 30 releases.
+    # The target line here is 1.x while upstream keeps publishing 2.x, so a
+    # hard page-1 cap would eventually hide every 1.x tag and break both the
+    # auto-pick below and -Tag for tags outside the first page.
+    $all = @()
+    $page = 1
+    while ($true) {
+        $paged = Invoke-RestMethod -Uri ("{0}?per_page=100&page={1}" -f $api, $page) -Headers $headers -TimeoutSec 30
+        if (-not $paged) { break }
+        $all += @($paged)
+        if (@($paged).Count -lt 100) { break }
+        $page++
+        if ($page -gt 10) { break }  # safety cap: 1000 releases is plenty
+    }
 
     if ($Tag) {
         $rel = $all | Where-Object { $_.tag_name -eq $Tag } | Select-Object -First 1
