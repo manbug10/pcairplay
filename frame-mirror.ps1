@@ -107,7 +107,7 @@ public static class FrameNative
     }
     public static IntPtr SetWindowLongPtr(IntPtr hWnd, int idx, IntPtr val)
     {
-        return IntPtr.Size == 8 ? SetWindowLongPtr64(hWnd, idx) : SetWindowLong32(hWnd, idx);
+        return IntPtr.Size == 8 ? SetWindowLongPtr64(hWnd, idx, val) : SetWindowLong32(hWnd, idx, val);
     }
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int w, int h, uint flags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
