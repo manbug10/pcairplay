@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
@@ -110,18 +111,33 @@ def run(name: str, uxplay_pid: int | None = None) -> int:
         if index == 1: window.get_style_context().add_class("bottom")
         windows.append(window)
 
+    probe_busy = []
+
+    def apply(found: tuple[int, int, int, int] | None) -> bool:
+        if found is None:
+            for item in windows: item.hide()
+        else:
+            for item, (x, y, width, height) in zip(windows, geometry(found)):
+                item.move(x, y); item.resize(width, height); item.show()
+        probe_busy.clear()
+        return False  # One-shot idle callback.
+
+    def probe() -> None:
+        found = find_window(name)
+        GLib.idle_add(apply, found)
+
     def update():
         # Follow the receiver's lifetime when a PID was supplied: without
         # this the frame keeps polling forever after uxplay is gone.
         if uxplay_pid is not None and not uxplay_alive(uxplay_pid):
             Gtk.main_quit()
             return False
-        found = find_window(name)
-        if not found:
-            for item in windows: item.hide()
-            return True
-        for item, (x, y, width, height) in zip(windows, geometry(found)):
-            item.move(x, y); item.resize(width, height); item.show()
+        # wmctrl is an external process: query it from a worker thread and
+        # apply the geometry on the GTK loop, so a busy window manager can
+        # never freeze the frame.  At most one probe runs at a time.
+        if not probe_busy:
+            probe_busy.append(True)
+            threading.Thread(target=probe, daemon=True).start()
         return True
 
     GLib.timeout_add(250, update)
