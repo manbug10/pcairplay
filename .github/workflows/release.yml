@@ -5,6 +5,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Tag pushes occasionally fail to register the trigger; workflow_dispatch
+  # against the tag ref reproduces the exact same build on demand.
+  workflow_dispatch:
 
 permissions:
   contents: write
