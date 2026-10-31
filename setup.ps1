@@ -605,7 +605,8 @@ if ($WhatIfPreference) {
     Write-Step "Verifying"
 
     $ux = Find-UxPlay      # re-resolve: the install happened after the first lookup
-    if ($ux -and $ux.Kind -eq 'Cli') {
+    $enginePresent = [bool]($ux -and $ux.Kind -eq 'Cli')
+    if ($enginePresent) {
         Write-Ok "Engine: $($ux.Exe)$(if ($ux.Version) { " (version $($ux.Version))" })"
         if ($ux.PluginDir) {
             Write-Ok "GStreamer plugins: $($ux.PluginDir)"
@@ -622,12 +623,21 @@ if ($WhatIfPreference) {
     } elseif ($ux -and $ux.Kind -eq 'GuiOnly') {
         Write-Bad "Installed build is 2.x (GUI only) - no uxplay.exe for the launchers."
         $script:failed++
+    } elseif ($SkipInstall) {
+        # -SkipInstall is the headless/CI mode: no engine is expected, so its
+        # absence is a notice, not a setup failure. Real mirroring still needs
+        # uxplay.exe - doctor.ps1 reports exactly that.
+        Write-Warn "Engine not found (-SkipInstall): expected on headless machines."
     } else {
         Write-Bad "uxplay.exe still not found after install."
         $script:failed++
     }
 
-    foreach ($n in (@($rules.Name) + @($progRule))) {
+    # The program-scoped rule is only created when an engine was found, so it
+    # is only verified when one was found; the port rules are always verified.
+    $verifyRules = @($rules.Name)
+    if ($enginePresent) { $verifyRules += $progRule }
+    foreach ($n in $verifyRules) {
         # Get-FirewallRuleState, not a bare '-eq ''True''' on an unwrapped result:
         # .Enabled is an enum, and -DisplayName can return several rules, so the
         # naive test both reads as a string comparison and fails open. This is
