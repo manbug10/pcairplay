@@ -143,21 +143,31 @@ $Name = $resolved.Name
 
 $ux = Find-UxPlay
 if (-not $ux) {
-    Write-Host "UxPlay is not installed." -ForegroundColor Red
-    Write-Host "Run setup.ps1 as Administrator first." -ForegroundColor Yellow
-    exit 1
+    if ($DryRun) {
+        # A dry run exists precisely to preview the argv without an engine
+        # (that is how CI exercises it on a box with no UxPlay installed).
+        Write-Host "NOTE: UxPlay is not installed - previewing the arguments anyway." -ForegroundColor Yellow
+    } else {
+        Write-Host "UxPlay is not installed." -ForegroundColor Red
+        Write-Host "Run setup.ps1 as Administrator first." -ForegroundColor Yellow
+        exit 1
+    }
 }
 # 2.x is installed but has no command line, so every flag below is meaningless
 # there. Say so once, in the shared wording, instead of failing obscurely.
-if ($ux.Kind -ne 'Cli') {
-    Write-Host (Get-UxPlayIncompatibleMessage -UxPlay $ux) -ForegroundColor Yellow
-    exit 1
+if ($ux -and $ux.Kind -ne 'Cli') {
+    if ($DryRun) {
+        Write-Host "NOTE: the installed build is 2.x (GUI only) - previewing the arguments anyway." -ForegroundColor Yellow
+    } else {
+        Write-Host (Get-UxPlayIncompatibleMessage -UxPlay $ux) -ForegroundColor Yellow
+        exit 1
+    }
 }
-$exe = $ux.Exe
-$pluginDir = $ux.PluginDir
+$exe = if ($ux) { $ux.Exe } else { $null }
+$pluginDir = if ($ux) { $ux.PluginDir } else { $null }
 
-Initialize-UxPlayEnvironment -UxPlay $ux
-if (-not $pluginDir) {
+if ($ux) { Initialize-UxPlayEnvironment -UxPlay $ux }
+if ($ux -and -not $pluginDir) {
     Write-Host "WARNING: no GStreamer plugin directory found near $exe." -ForegroundColor Yellow
     Write-Host "         The receiver may start but show a black window (no video sink)." -ForegroundColor Yellow
 }
@@ -213,7 +223,7 @@ foreach ($n in $built.Notes) { Write-Host "Note: $n" -ForegroundColor Yellow }
 if ($DryRun) {
     Write-Host ""
     Write-Host "  DRY RUN - nothing will be started." -ForegroundColor Cyan
-    Write-Host "  Engine : $exe"
+    Write-Host "  Engine : $(if ($exe) { $exe } else { '(not installed - these are the args that would be used)' })"
     Write-Host "  Args   :"
     foreach ($a in $argList) { Write-Host "    $a" -ForegroundColor Gray }
     Write-Host ""
