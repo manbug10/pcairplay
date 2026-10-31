@@ -95,6 +95,7 @@ ufw_is_active() {
 if ((UNINSTALL)); then
     note 'Removing AirPlayPC user integration'
     if ((DRY_RUN)); then
+        printf '    + systemctl --user disable --now %q\n' 'pcairplay.service'
         printf '    + rm -rf %q\n' "$APP_DIR"
         printf '    + rm -f %q %q %q %q %q %q %q %q\n' \
             "$BIN_DIR/pcairplay" "$BIN_DIR/pcairplay-ui" \
@@ -102,6 +103,12 @@ if ((UNINSTALL)); then
             "$DESKTOP_DIR/pcairplay-diagnostics.desktop" "$DESKTOP_DIR/pcairplay-control.desktop" \
             "$ICON_DIR/pcairplay.svg" "$SYSTEMD_DIR/pcairplay.service"
     else
+        # Stop and disable the unit BEFORE deleting its file: daemon-reload
+        # alone never stops an active unit, and skipping this left the receiver
+        # running (plus a dangling wants symlink) after a "successful" removal.
+        if command -v systemctl >/dev/null; then
+            systemctl --user disable --now pcairplay.service 2>/dev/null || true
+        fi
         rm -rf -- "$APP_DIR"
         rm -f -- "$BIN_DIR/pcairplay" "$BIN_DIR/pcairplay-ui" "$BIN_DIR/pcairplay-control" \
             "$DESKTOP_DIR/pcairplay.desktop" "$DESKTOP_DIR/pcairplay-diagnostics.desktop" \
@@ -143,13 +150,13 @@ if ! command -v uxplay >/dev/null || ((SOURCE_BUILD)); then
         install_uxplay_from_source
     elif pacman -Si uxplay >/dev/null 2>&1; then
         note 'Installing UxPlay from a configured package repository'
-        run sudo pacman -S --needed uxplay
+        run sudo pacman -S --needed --noconfirm uxplay
     elif command -v paru >/dev/null; then
         note 'Installing UxPlay from AUR with paru'
-        run paru -S --needed uxplay
+        run paru -S --needed --noconfirm uxplay
     elif command -v yay >/dev/null; then
         note 'Installing UxPlay from AUR with yay'
-        run yay -S --needed uxplay
+        run yay -S --needed --noconfirm uxplay
     else
         warn 'No repository package or AUR helper found; using the auditable pinned source build.'
         install_uxplay_from_source
@@ -189,7 +196,9 @@ check_uxplay
 note 'Installing runtime dependencies'
 packages=(gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav iproute2 avahi)
 if ((!NO_GUI)); then packages+=(gtk3 gtk4 python-gobject gst-plugin-gtk4 wmctrl bluez bluez-utils python-dbus-fast curl); fi
-run sudo pacman -S --needed "${packages[@]}"
+# --noconfirm keeps non-interactive runs (CI, curl | bash) from aborting at
+# the first pacman prompt, consistent with the source-build path above.
+run sudo pacman -S --needed --noconfirm "${packages[@]}"
 
 if ((!NO_GUI)); then
     note 'Enabling Bluetooth for AssistiveTouch control'
@@ -253,6 +262,21 @@ if ((!NO_GUI)); then
     run install -m 0644 "$SCRIPT_DIR/pcairplay.desktop" "$DESKTOP_DIR/pcairplay.desktop"
     run install -m 0644 "$SCRIPT_DIR/pcairplay-diagnostics.desktop" "$DESKTOP_DIR/pcairplay-diagnostics.desktop"
     run install -m 0644 "$SCRIPT_DIR/pcairplay-control.desktop" "$DESKTOP_DIR/pcairplay-control.desktop"
+    if ((DRY_RUN)); then
+        printf '    + rewrite Exec=/TryExec= in the installed .desktop files to %q\n' "$BIN_DIR"
+    else
+        # The shipped .desktop files use bare command names, which a PKGBUILD
+        # install resolves via /usr/bin. A user-local install lives in
+        # ~/.local/bin, which the systemd user manager and several Wayland
+        # sessions do NOT put on PATH - without absolute paths the menu
+        # launchers fail with "command not found" after a clean install.
+        sed -i "s|^Exec=pcairplay-ui$|Exec=$BIN_DIR/pcairplay-ui|; s|^TryExec=.*$|TryExec=$BIN_DIR/pcairplay-ui|" \
+            "$DESKTOP_DIR/pcairplay.desktop"
+        sed -i "s|^Exec=pcairplay-control --start$|Exec=$BIN_DIR/pcairplay-control --start|; s|^TryExec=.*$|TryExec=$BIN_DIR/pcairplay-control|" \
+            "$DESKTOP_DIR/pcairplay-control.desktop"
+        sed -i "s|^Exec=pcairplay doctor$|Exec=$BIN_DIR/pcairplay doctor|; s|^TryExec=.*$|TryExec=$BIN_DIR/pcairplay|" \
+            "$DESKTOP_DIR/pcairplay-diagnostics.desktop"
+    fi
     run install -m 0644 "$SCRIPT_DIR/pcairplay.svg" "$ICON_DIR/pcairplay.svg"
 
     note 'Installing pinned Bluetooth HID helper'
@@ -276,8 +300,10 @@ if ((!NO_GUI)); then
     fi
 fi
 run install -m 0644 "$SCRIPT_DIR/pcairplay.service" "$SYSTEMD_DIR/pcairplay.service"
-if command -v systemctl >/dev/null; then run systemctl --user daemon-reload; fi
-if command -v update-desktop-database >/dev/null && ((!NO_GUI)); then run update-desktop-database "$DESKTOP_DIR"; fi
+# Best-effort refreshes: failing here (e.g. no user systemd running) must not
+# abort the whole install AFTER every file is already in place.
+if command -v systemctl >/dev/null; then run systemctl --user daemon-reload || true; fi
+if command -v update-desktop-database >/dev/null && ((!NO_GUI)); then run update-desktop-database "$DESKTOP_DIR" || true; fi
 
 note 'Verification'
 if ((DRY_RUN)); then

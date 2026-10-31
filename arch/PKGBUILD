@@ -6,6 +6,10 @@ pkgdesc='Arch Linux controller, diagnostics, and desktop integration for UxPlay'
 arch=('any')
 url='https://github.com/gbulog/pcairplay'
 license=('MIT')
+# NOTE: 'uxplay' lives in the AUR, not in the official repositories, so a
+# plain `makepkg -si` cannot resolve it (pacman does not see the AUR).
+# Install it first with an AUR helper (paru -S uxplay / yay -S uxplay), or
+# use the helper for this package as well - see arch/README.md.
 depends=('uxplay' 'python' 'python-gobject' 'gtk3' 'gtk4' 'gst-plugin-gtk4' 'wmctrl'
          'gst-plugins-base' 'gst-plugins-good' 'gst-plugins-bad' 'gst-libav'
          'iproute2' 'bluez' 'bluez-utils' 'python-dbus-fast')

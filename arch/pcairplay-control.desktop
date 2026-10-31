@@ -2,6 +2,7 @@
 Type=Application
 Name=AirPlayPC Mirror & Control
 Comment=Mirror and control an iPhone in one window
+TryExec=pcairplay-control
 Exec=pcairplay-control --start
 Icon=pcairplay
 Terminal=false

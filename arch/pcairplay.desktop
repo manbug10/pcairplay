@@ -2,6 +2,7 @@
 Type=Application
 Name=AirPlayPC
 Comment=Mirror an iPhone or iPad with native AirPlay Screen Mirroring
+TryExec=pcairplay-ui
 Exec=pcairplay-ui
 Icon=pcairplay
 Terminal=false

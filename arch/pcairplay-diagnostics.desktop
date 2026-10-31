@@ -2,6 +2,7 @@
 Type=Application
 Name=AirPlayPC Diagnostics
 Comment=Check UxPlay, mDNS, GStreamer, network, ports, and firewall
+TryExec=pcairplay
 Exec=pcairplay doctor
 Icon=pcairplay
 Terminal=true

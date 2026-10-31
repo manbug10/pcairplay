@@ -16,8 +16,8 @@ Wine, Bonjour, or the Windows UxPlay bundle.
 | `PKGBUILD` | Optional system-wide `pcairplay-git` package recipe |
 | `pcairplay.service` | Optional rootless systemd user service |
 
-Top-level `setup.sh`, `start-airplay.sh`, `doctor.sh`, and `AirPlayPC.sh` are
-convenience launchers for these files.
+Top-level `setup.sh`, `start-airplay.sh`, `doctor.sh`, `AirPlayPC.sh`, and
+`AirPlayPC-Control.sh` are convenience launchers for these files.
 
 ## Design choices
 
@@ -98,5 +98,10 @@ only to subscribed characteristics and is captured only by the focused control
 window.
 
 For a tracked system-wide install instead of the user-local setup script, copy
-`arch/PKGBUILD` to an empty build directory and run `makepkg -si`. Its `uxplay`
-dependency is resolved from a configured binary repository or AUR.
+`arch/PKGBUILD` to an empty build directory and run `makepkg -si`. IMPORTANT:
+`uxplay` lives in the AUR, not in the official repositories, and `makepkg -s`
+resolves dependencies with pacman alone - a plain `makepkg -si` therefore fails
+with `target not found: uxplay` on a clean Arch system. Install the dependency
+first with an AUR helper (`paru -S uxplay` or `yay -S uxplay`), then run
+`makepkg -si`; or use the helper for both, e.g. `paru -S pcairplay-git` after
+adding this PKGBUILD locally.

@@ -1,13 +1,22 @@
 [Unit]
 Description=AirPlayPC receiver
-After=graphical-session.target network-online.target
-Wants=network-online.target
+# A graphical app unit must be part of the graphical session: WantedBy=
+# default.target starts long before any display exists, and After= alone does
+# not pull graphical-session.target into the transaction.
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/pcairplay start
 Restart=on-failure
 RestartSec=3
+# UxPlay needs a display. Desktop sessions that import their environment into
+# the systemd user manager (GNOME, KDE) provide DISPLAY/WAYLAND_DISPLAY;
+# otherwise set them here or in an EnvironmentFile:
+#Environment=DISPLAY=:0
+#EnvironmentFile=-%h/.config/pcairplay/service.env
 
 [Install]
-WantedBy=default.target
+# Enabled together with graphical-session.target (start/stop with the session).
+WantedBy=graphical-session.target

@@ -83,6 +83,13 @@ To run it whenever your user session starts:
 systemctl --user enable --now pcairplay.service
 ```
 
+The unit is bound to `graphical-session.target`, so it starts and stops with
+your desktop session. It needs a display: GNOME and KDE import
+`DISPLAY`/`WAYLAND_DISPLAY` into the systemd user manager automatically; on
+other desktops, set them in the unit (or in
+`~/.config/pcairplay/service.env` via the prepared `EnvironmentFile=` line).
+Run `journalctl --user -u pcairplay.service` if it fails to start.
+
 To remove the integration and firewall rules later (UxPlay, settings, pairing
 data, and logs are deliberately retained):
 
